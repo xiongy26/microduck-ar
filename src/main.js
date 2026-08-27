@@ -192,10 +192,28 @@ function quack() {
   a.play().catch(() => {});
 }
 let jawHeld = false;
+// Ground-pick beak: the exported policies have no mouth channel, so the
+// peck is re-created on the pick's phase clock (open on approach, snap
+// shut on the scoop) - same keys as the playground.
+const PICK_JAW_KEYS = [[0.10, 0], [0.20, 1], [0.40, 1], [0.50, 0]];
+function pickJawNow() {
+  const phase = sim?.pickPhase;
+  if (phase == null) return 0;
+  const K = PICK_JAW_KEYS;
+  if (phase <= K[0][0] || phase >= K[K.length - 1][0]) return 0;
+  for (let i = 1; i < K.length; i++) {
+    if (phase > K[i][0]) continue;
+    const [p0, v0] = K[i - 1];
+    const [p1, v1] = K[i];
+    const t = (phase - p0) / (p1 - p0);
+    return v0 + (v1 - v0) * (1 - Math.cos(Math.PI * t)) / 2;
+  }
+  return 0;
+}
 function jawOpenNow() {
   const t = (performance.now() - quackAt) / QUACK_MS;
   const flap = t >= 0 && t < 1 ? Math.sin(Math.PI * t) : 0;
-  return Math.max(flap, jawHeld ? 1 : 0);
+  return Math.min(1, pickJawNow() + Math.max(flap, jawHeld ? 1 : 0));
 }
 
 // ── Boot: rig + sim load in parallel while the landing shows progress ───
@@ -250,6 +268,7 @@ bindButton($("btn-kick"), () => {
   if (sim?.triggerKick(kickFoot)) kickFoot = kickFoot === "left" ? "right" : "left";
 });
 bindButton($("btn-roll"), () => sim?.triggerRoll());
+bindButton($("btn-pick"), () => sim?.triggerGroundPick());
 bindButton($("btn-quack"), () => { quack(); jawHeld = true; }, () => { jawHeld = false; });
 bindButton($("btn-reset"), () => sim?.resetSim());
 bindButton($("btn-ball"), () => sim?.spawnBall());

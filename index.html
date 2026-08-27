@@ -116,14 +116,14 @@
         display: flex; align-items: flex-end; gap: 14px; pointer-events: auto;
       }
       .cap {
-        width: 64px; height: 64px; border-radius: 50%;
+        width: 56px; height: 56px; border-radius: 50%;
         border: 2px solid rgba(245, 242, 234, 0.5);
         background: rgba(8, 8, 12, 0.45); color: var(--paper);
         font: inherit; font-size: 11px; letter-spacing: 0.06em;
         cursor: pointer; text-transform: uppercase;
       }
       .cap.down { background: var(--accent); color: var(--ink); border-color: var(--accent); }
-      #btn-kick { width: 76px; height: 76px; font-size: 13px; }
+      #btn-kick { width: 70px; height: 70px; font-size: 13px; }
       #mode-tag {
         position: absolute; left: 20px;
         top: max(14px, env(safe-area-inset-top));
@@ -161,6 +161,7 @@
         <div id="touch-stick"><div class="nub"></div></div>
       </div>
       <div id="actions" hidden>
+        <button class="cap" id="btn-pick">pick</button>
         <button class="cap" id="btn-roll">roll</button>
         <button class="cap" id="btn-quack">quack</button>
         <button class="cap" id="btn-kick">kick</button>

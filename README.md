@@ -33,6 +33,7 @@ No server: physics, policy inference and rendering all run in the browser.
 
 - Floating stick (left half of the screen): forward / back + turn
 - KICK: one-shot blind kick, alternating feet
+- PICK: peck the ground and stand back up
 - ROLL: roulade + recover
 - QUACK: chirp + beak (hold to keep the beak open)
 - BALL: (re)spawn the beach ball in front of the duck

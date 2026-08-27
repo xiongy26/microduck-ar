@@ -23,6 +23,7 @@ const POLICIES = {
   kickL: `${POLICY_DIR}/ball_kick_left.onnx`,
   kickR: `${POLICY_DIR}/ball_kick_right.onnx`,
   roll: `${POLICY_DIR}/roulade.onnx`,
+  groundpick: `${POLICY_DIR}/alpha_ground_pick.onnx`,
   stand: `${POLICY_DIR}/BEST_alpha_stand.onnx`,
 };
 
@@ -54,6 +55,10 @@ export const FENCE_HALF = 1.0;
 
 const KICK_STEPS = 25; // 0.5 s window
 const POST_KICK_LOCK_STEPS = 20;
+// Ground-pick one-shot: phase clock encoded as [cos, sin, 0] in the
+// command vel slots (runtime defaults: 4 s period, cycle exits at 0.7).
+const GROUND_PICK_PERIOD_S = 4.0;
+const GROUND_PICK_END_PHASE = 0.7;
 // Fall recovery (mirrors the runtime's --fall-detect state machine).
 const FALL_DEBOUNCE_STEPS = 10;
 const FALL_SETTLE_STEPS = 15;
@@ -173,9 +178,10 @@ export async function createSim({ onProgress = () => {}, getCommand }) {
   const cmd = new Float32Array(CMD_SIZE);
   const ZERO_CMD = new Float32Array(3);
 
-  let mode = "walk"; // "walk" | "roll" | "kickL" | "kickR"
+  let mode = "walk"; // "walk" | "roll" | "kickL" | "kickR" | "groundpick"
   let kickRun = null;
   let rollRun = null;
+  let pickRun = null;
   let postKickLock = 0;
   let recovery = null; // null | { state: "fallen"|"recovering", steps, uprightSteps }
   let fallDebounce = 0;
@@ -186,7 +192,10 @@ export async function createSim({ onProgress = () => {}, getCommand }) {
 
   const listeners = { mode: [] };
   const emitMode = () => {
-    const label = recovery ? "recovery" : mode === "roll" ? "roll" : isKick() ? "kick" : "walk";
+    const label = recovery ? "recovery"
+      : mode === "roll" ? "roll"
+      : mode === "groundpick" ? "pick"
+      : isKick() ? "kick" : "walk";
     for (const fn of listeners.mode) fn(label);
   };
 
@@ -205,7 +214,7 @@ export async function createSim({ onProgress = () => {}, getCommand }) {
   }
 
   function resetSim() {
-    kickRun = null; rollRun = null; postKickLock = 0;
+    kickRun = null; rollRun = null; pickRun = null; postKickLock = 0;
     recovery = null; fallDebounce = 0; fallenSince = null;
     mode = "walk";
     mujoco.mj_resetDataKeyframe(model, data, standKeyId);
@@ -256,8 +265,16 @@ export async function createSim({ onProgress = () => {}, getCommand }) {
     for (let j = 0; j < NUM_JOINTS; j++) obs[i++] = qvel[dofAdr[j]];
     for (let j = 0; j < NUM_JOINTS; j++) obs[i++] = lastAction[j];
     cmd.fill(0);
-    const c = effectiveCmd();
-    cmd[0] = c[0]; cmd[1] = c[1]; cmd[2] = c[2];
+    if (mode === "groundpick" && pickRun) {
+      // Phase encoding in the vel slots; head/body slots stay zero-padded
+      // (the runtime's zero_command_padding).
+      const a = 2 * Math.PI * pickRun.phase;
+      cmd[0] = Math.cos(a);
+      cmd[1] = Math.sin(a);
+    } else {
+      const c = effectiveCmd();
+      cmd[0] = c[0]; cmd[1] = c[1]; cmd[2] = c[2];
+    }
     for (let c2 = 0; c2 < CMD_SIZE; c2++) obs[i++] = cmd[c2];
     return obs;
   }
@@ -344,6 +361,17 @@ export async function createSim({ onProgress = () => {}, getCommand }) {
       }
     }
 
+    // Ground-pick one-shot: advance the trained phase clock and hand back
+    // to walk at the runtime's cycle end (~2.8 s).
+    if (mode === "groundpick" && pickRun) {
+      pickRun.phase += CTRL_DT / GROUND_PICK_PERIOD_S;
+      if (pickRun.phase >= GROUND_PICK_END_PHASE) {
+        pickRun = null;
+        mode = "walk";
+        emitMode();
+      }
+    }
+
     if (mode === "roll" && rollRun) {
       rollRun.steps++;
       if (obs[5] > -0.3) rollRun.tipped = true;
@@ -399,6 +427,14 @@ export async function createSim({ onProgress = () => {}, getCommand }) {
     return true;
   }
 
+  function triggerGroundPick() {
+    if (mode !== "walk" || recovery || postKickLock > 0) return false;
+    mode = "groundpick";
+    pickRun = { phase: 0 };
+    emitMode();
+    return true;
+  }
+
   step("ready");
   return {
     model, data, mujoco,
@@ -409,7 +445,8 @@ export async function createSim({ onProgress = () => {}, getCommand }) {
     get ctrlHz() { return ctrlHz; },
     get paused() { return paused; },
     set paused(v) { paused = v; },
-    resetSim, spawnBall, parkBallPhysics, triggerKick, triggerRoll,
+    get pickPhase() { return mode === "groundpick" ? pickRun?.phase ?? null : null; },
+    resetSim, spawnBall, parkBallPhysics, triggerKick, triggerRoll, triggerGroundPick,
     onMode: (fn) => listeners.mode.push(fn),
     destroy: () => { running = false; },
   };
