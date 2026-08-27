@@ -1,0 +1,453 @@
+// Microduck AR: the microduck-simulator playground's physics/policy core
+// wrapped in a WebXR immersive-ar scene. Scan the floor, tap to place the
+// duck at true scale (~25 cm tall), drive it with a floating stick.
+//
+// AR routes:
+//   - Android Chrome: native WebXR immersive-ar.
+//   - iPhone/iPad: Safari has no WebXR; the Variant Launch SDK (App Clip)
+//     provides a standards-compliant session when window.VL_KEY is set.
+//   - Everything else: 3D preview with orbit controls.
+
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import {
+  buildRig, loadKinematics, setJoint, setJawOpen, MODEL_DIR,
+} from "./duck.js";
+import { materialHookFor, VARIANTS, DEFAULT_VARIANT } from "./variants.js";
+import {
+  createSim, JOINT_NAMES, NUM_JOINTS,
+  VEL_FWD, VEL_BACK, VEL_ANG, BALL_RADIUS, FENCE_HALF,
+} from "./sim.js";
+import { Joystick, bindButton } from "./joystick.js";
+import { signed } from "./signed.js";
+
+const $ = (id) => document.getElementById(id);
+const landing = $("landing"), statusEl = $("status");
+const overlay = $("overlay"), hint = $("hint"), modeTag = $("mode-tag");
+const btnAr = $("btn-ar"), btnPreview = $("btn-preview"), iosNote = $("ios-note");
+
+const setStatus = (s) => { statusEl.textContent = s; };
+const setHint = (s) => { hint.textContent = s; hint.style.display = s ? "" : "none"; };
+
+// ── iOS / Variant Launch detection ──────────────────────────────────────
+const IS_IOS = /iPhone|iPad|iPod/.test(navigator.userAgent) ||
+  (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+const VL_KEY = new URLSearchParams(location.search).get("vlkey") || window.VL_KEY || "";
+
+async function arSupported() {
+  try {
+    return !!navigator.xr && await navigator.xr.isSessionSupported("immersive-ar");
+  } catch {
+    return false;
+  }
+}
+
+// On iOS Safari (no WebXR) with a VL key configured, load the SDK: it
+// shows the App Clip launch flow and reopens this page inside a
+// WebXR-capable wrapper. Resolves once the SDK is ready (or failed).
+function loadVariantLaunch() {
+  return new Promise((resolve) => {
+    const s = document.createElement("script");
+    s.src = `https://launchar.app/sdk/v1?key=${encodeURIComponent(VL_KEY)}&redirect=true`;
+    s.onload = () => resolve(true);
+    s.onerror = () => resolve(false);
+    document.head.appendChild(s);
+  });
+}
+
+// ── Renderer / scene (shared by AR and the preview) ─────────────────────
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.xr.enabled = true;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.01, 40);
+camera.position.set(0.7, 0.5, 0.9);
+
+window.addEventListener("resize", () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+
+// Anchor: the tapped floor point. MuJoCo's world origin maps here.
+const anchor = new THREE.Group();
+anchor.visible = false;
+scene.add(anchor);
+
+// Lights ride the anchor so shadows stay centred on the play area.
+const hemi = new THREE.HemisphereLight(0xffffff, 0x777788, 1.0);
+anchor.add(hemi);
+const sun = new THREE.DirectionalLight(0xfff3e0, 2.2);
+sun.position.set(0.8, 1.6, 0.6);
+sun.castShadow = true;
+sun.shadow.mapSize.set(1024, 1024);
+sun.shadow.camera.left = -1.4; sun.shadow.camera.right = 1.4;
+sun.shadow.camera.top = 1.4; sun.shadow.camera.bottom = -1.4;
+sun.shadow.camera.near = 0.1; sun.shadow.camera.far = 5;
+sun.shadow.bias = -0.0005;
+anchor.add(sun);
+anchor.add(sun.target);
+
+// Shadow catcher: invisible plane that only shows the duck's shadow on
+// the real floor.
+const shadowPlane = new THREE.Mesh(
+  new THREE.CircleGeometry(1.35, 48),
+  new THREE.ShadowMaterial({ opacity: 0.35 }),
+);
+shadowPlane.rotation.x = -Math.PI / 2;
+shadowPlane.position.y = 0.002;
+shadowPlane.receiveShadow = true;
+anchor.add(shadowPlane);
+
+// Ball visual inside a Z-up -> Y-up converter, so it can take raw MJCF
+// poses exactly like the duck's trunk does inside rig.root.
+const ballRoot = new THREE.Group();
+ballRoot.rotation.x = -Math.PI / 2;
+anchor.add(ballRoot);
+function beachBallTexture() {
+  const c = document.createElement("canvas");
+  c.width = 256; c.height = 128;
+  const g = c.getContext("2d");
+  const cols = ["#ff7a2f", "#f5f2ea", "#ffb52e", "#f5f2ea", "#e9553a", "#f5f2ea"];
+  for (let i = 0; i < 6; i++) {
+    g.fillStyle = cols[i];
+    g.fillRect((256 / 6) * i, 0, 256 / 6 + 1, 128);
+  }
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  return t;
+}
+const ballMesh = new THREE.Mesh(
+  new THREE.SphereGeometry(BALL_RADIUS, 32, 24),
+  new THREE.MeshStandardMaterial({ map: beachBallTexture(), roughness: 0.4 }),
+);
+ballMesh.castShadow = true;
+ballMesh.visible = false;
+ballRoot.add(ballMesh);
+
+// Reticle for floor placement.
+const reticle = new THREE.Mesh(
+  new THREE.RingGeometry(0.09, 0.115, 40).rotateX(-Math.PI / 2),
+  new THREE.MeshBasicMaterial({ color: 0xffb52e, transparent: true, opacity: 0.9 }),
+);
+const reticleDot = new THREE.Mesh(
+  new THREE.CircleGeometry(0.02, 20).rotateX(-Math.PI / 2),
+  new THREE.MeshBasicMaterial({ color: 0xf5f2ea }),
+);
+reticle.add(reticleDot);
+reticle.matrixAutoUpdate = false;
+reticle.visible = false;
+scene.add(reticle);
+
+// ── Inputs ──────────────────────────────────────────────────────────────
+const joystick = new Joystick({
+  zone: $("touch-zone"),
+  stick: $("touch-stick"),
+  nub: $("touch-stick").querySelector(".nub"),
+  limits: [VEL_FWD, VEL_BACK, VEL_ANG],
+});
+// Keyboard (preview mode / desktop debugging): arrows or WASD.
+const keys = new Set();
+window.addEventListener("keydown", (e) => keys.add(e.code));
+window.addEventListener("keyup", (e) => keys.delete(e.code));
+const kbCommand = new Float32Array(3);
+function pollKeyboard() {
+  const fwd = keys.has("ArrowUp") || keys.has("KeyW");
+  const back = keys.has("ArrowDown") || keys.has("KeyS");
+  const left = keys.has("ArrowLeft") || keys.has("KeyA");
+  const right = keys.has("ArrowRight") || keys.has("KeyD");
+  kbCommand[0] = fwd ? VEL_FWD : back ? VEL_BACK : 0;
+  kbCommand[2] = left ? VEL_ANG : right ? -VEL_ANG : 0;
+}
+const command = new Float32Array(3);
+function getCommand() {
+  const kb = kbCommand[0] !== 0 || kbCommand[2] !== 0;
+  command[0] = kb ? kbCommand[0] : joystick.command[0];
+  command[2] = kb ? kbCommand[2] : joystick.command[2];
+  return command;
+}
+
+// ── Quack (chirps from the robot's voice bank) ──────────────────────────
+const QUACK_MS = 480;
+let quackAt = -Infinity;
+const CHIRP_TAKES = "abcdefghijkl";
+const chirpCache = new Map();
+function quack() {
+  quackAt = performance.now();
+  const take = CHIRP_TAKES[(Math.random() * CHIRP_TAKES.length) | 0];
+  const url = signed(`./voices/chirp_${take}.wav`);
+  let a = chirpCache.get(url);
+  if (!a) {
+    a = new Audio(url);
+    a.volume = 0.7;
+    chirpCache.set(url, a);
+  }
+  a.currentTime = 0;
+  a.play().catch(() => {});
+}
+let jawHeld = false;
+function jawOpenNow() {
+  const t = (performance.now() - quackAt) / QUACK_MS;
+  const flap = t >= 0 && t < 1 ? Math.sin(Math.PI * t) : 0;
+  return Math.max(flap, jawHeld ? 1 : 0);
+}
+
+// ── Boot: rig + sim load in parallel while the landing shows progress ───
+let rig = null, sim = null, trunkGroup = null;
+const bootPromise = (async () => {
+  setStatus("loading duck model");
+  const k = await loadKinematics(`${MODEL_DIR}/kinematics.json`);
+  const [builtRig, builtSim] = await Promise.all([
+    buildRig(k, { materialForMesh: materialHookFor(VARIANTS[DEFAULT_VARIANT]) }),
+    createSim({ onProgress: setStatus, getCommand }),
+  ]);
+  rig = builtRig;
+  sim = builtSim;
+  trunkGroup = rig.bodies.get("trunk_base");
+  rig.placer.traverse((o) => { if (o.isMesh) o.castShadow = true; });
+  anchor.add(rig.placer);
+  sim.onMode((label) => { modeTag.textContent = label; });
+  // Debug/verification handle (same spirit as the playground's window.rl).
+  window.duckAR = { sim, rig, anchor, camera, renderer, getCommand };
+  setStatus("ready");
+})();
+bootPromise.catch((err) => {
+  console.error("[boot]", err);
+  setStatus(`boot failed: ${err?.message || err}`);
+});
+
+function syncFromSim() {
+  if (!sim || !rig) return;
+  const qpos = sim.data.qpos;
+  trunkGroup.position.set(qpos[0], qpos[1], qpos[2]);
+  trunkGroup.quaternion.set(qpos[4], qpos[5], qpos[6], qpos[3]);
+  for (let j = 0; j < NUM_JOINTS; j++) setJoint(rig, JOINT_NAMES[j], qpos[sim.qposAdr[j]]);
+  setJawOpen(rig, jawOpenNow());
+  const b = sim.ballQposAdr;
+  ballMesh.visible = sim.ballActive;
+  if (sim.ballActive) {
+    ballMesh.position.set(qpos[b], qpos[b + 1], qpos[b + 2]);
+    ballMesh.quaternion.set(qpos[b + 4], qpos[b + 5], qpos[b + 6], qpos[b + 3]);
+  }
+}
+
+// ── Session UI wiring ───────────────────────────────────────────────────
+const gameChips = [$("btn-reset"), $("btn-ball"), $("btn-size"), $("btn-replace")];
+function showGameUi(v) {
+  $("touch-zone").hidden = !v;
+  $("actions").hidden = !v;
+  modeTag.hidden = !v;
+  for (const c of gameChips) c.hidden = !v;
+}
+let kickFoot = "left";
+bindButton($("btn-kick"), () => {
+  if (sim?.triggerKick(kickFoot)) kickFoot = kickFoot === "left" ? "right" : "left";
+});
+bindButton($("btn-roll"), () => sim?.triggerRoll());
+bindButton($("btn-quack"), () => { quack(); jawHeld = true; }, () => { jawHeld = false; });
+bindButton($("btn-reset"), () => sim?.resetSim());
+bindButton($("btn-ball"), () => sim?.spawnBall());
+
+const SIZES = [1, 2, 3];
+let sizeIdx = 0;
+bindButton($("btn-size"), () => {
+  sizeIdx = (sizeIdx + 1) % SIZES.length;
+  anchor.scale.setScalar(SIZES[sizeIdx]);
+  $("btn-size").textContent = `size ${SIZES[sizeIdx]}x`;
+});
+
+// ── Placement ───────────────────────────────────────────────────────────
+let placing = false;
+const _hitPos = new THREE.Vector3();
+const _hitQuat = new THREE.Quaternion();
+const _hitScale = new THREE.Vector3();
+const _camPos = new THREE.Vector3();
+function placeAnchorFromReticle() {
+  reticle.matrix.decompose(_hitPos, _hitQuat, _hitScale);
+  anchor.position.copy(_hitPos);
+  // Face the duck (local +X) toward the viewer.
+  camera.getWorldPosition(_camPos);
+  const dx = _camPos.x - _hitPos.x, dz = _camPos.z - _hitPos.z;
+  const n = Math.hypot(dx, dz) || 1;
+  anchor.rotation.set(0, Math.atan2(-dz / n, dx / n), 0);
+  anchor.visible = true;
+  placing = false;
+  reticle.visible = false;
+  sim.resetSim();
+  sim.paused = false;
+  setHint("");
+  showGameUi(true);
+}
+bindButton($("btn-replace"), () => {
+  placing = true;
+  sim.paused = true;
+  showGameUi(false);
+  setHint("point at the floor, tap to move the duck");
+});
+
+// ── AR session ──────────────────────────────────────────────────────────
+let xrSession = null;
+let hitTestSource = null;
+let localSpace = null;
+
+async function startAr() {
+  await bootPromise;
+  const overlayRoot = overlay;
+  xrSession = await navigator.xr.requestSession("immersive-ar", {
+    requiredFeatures: ["hit-test"],
+    optionalFeatures: ["dom-overlay", "local-floor", "light-estimation"],
+    domOverlay: { root: overlayRoot },
+  });
+  // Touches on the control overlay must not double as AR select taps.
+  overlayRoot.addEventListener("beforexrselect", (e) => e.preventDefault());
+  landing.style.display = "none";
+  overlay.classList.add("live");
+  showGameUi(false);
+  setHint("point your phone at the floor");
+  placing = true;
+  anchor.visible = false;
+  anchor.scale.setScalar(SIZES[sizeIdx]);
+
+  renderer.xr.setReferenceSpaceType("local-floor");
+  try {
+    await renderer.xr.setSession(xrSession);
+  } catch {
+    renderer.xr.setReferenceSpaceType("local");
+    await renderer.xr.setSession(xrSession);
+  }
+  localSpace = renderer.xr.getReferenceSpace();
+  const viewerSpace = await xrSession.requestReferenceSpace("viewer");
+  hitTestSource = await xrSession.requestHitTestSource({ space: viewerSpace });
+
+  xrSession.addEventListener("select", () => {
+    if (placing && reticle.visible) placeAnchorFromReticle();
+  });
+  xrSession.addEventListener("end", () => {
+    xrSession = null;
+    hitTestSource = null;
+    sim.paused = true;
+    overlay.classList.remove("live");
+    landing.style.display = "";
+    anchor.visible = false;
+    setStatus("ready");
+  });
+}
+bindButton($("btn-exit"), () => {
+  if (xrSession) xrSession.end().catch(() => {});
+  else exitPreview();
+});
+
+// ── 3D preview (desktop / unsupported browsers) ─────────────────────────
+let previewOn = false;
+let controls = null;
+const previewFloor = new THREE.Mesh(
+  new THREE.CircleGeometry(2.2, 64).rotateX(-Math.PI / 2),
+  new THREE.MeshStandardMaterial({ color: 0x2a2a33, roughness: 0.9 }),
+);
+previewFloor.receiveShadow = true;
+previewFloor.visible = false;
+scene.add(previewFloor);
+const previewGrid = new THREE.GridHelper(4.4, 22, 0x555560, 0x33333c);
+previewGrid.position.y = 0.001;
+previewGrid.visible = false;
+scene.add(previewGrid);
+
+async function startPreview() {
+  await bootPromise;
+  previewOn = true;
+  landing.style.display = "none";
+  overlay.classList.add("live");
+  scene.background = new THREE.Color(0x101016);
+  previewFloor.visible = true;
+  previewGrid.visible = true;
+  anchor.position.set(0, 0, 0);
+  anchor.rotation.set(0, Math.PI / 2, 0); // duck faces the camera
+  anchor.visible = true;
+  controls ??= new OrbitControls(camera, renderer.domElement);
+  controls.target.set(0, 0.12, 0);
+  controls.minDistance = 0.3;
+  controls.maxDistance = 5;
+  controls.maxPolarAngle = Math.PI / 2 - 0.02;
+  controls.enabled = true;
+  setHint("");
+  showGameUi(true);
+  sim.resetSim();
+  sim.paused = false;
+}
+function exitPreview() {
+  previewOn = false;
+  sim.paused = true;
+  if (controls) controls.enabled = false;
+  scene.background = null;
+  previewFloor.visible = false;
+  previewGrid.visible = false;
+  anchor.visible = false;
+  overlay.classList.remove("live");
+  landing.style.display = "";
+}
+
+// ── Frame loop (drives both AR and preview) ─────────────────────────────
+renderer.setAnimationLoop((t, frame) => {
+  pollKeyboard();
+  joystick.poll();
+  if (frame && hitTestSource && placing) {
+    const hits = frame.getHitTestResults(hitTestSource);
+    if (hits.length) {
+      const pose = hits[0].getPose(localSpace);
+      if (pose) {
+        reticle.visible = true;
+        reticle.matrix.fromArray(pose.transform.matrix);
+        setHint("tap to place the duck");
+      }
+    } else {
+      reticle.visible = false;
+      setHint("point your phone at the floor - move slowly");
+    }
+  }
+  syncFromSim();
+  if (previewOn && controls) controls.update();
+  renderer.render(scene, camera);
+});
+
+// ── Landing buttons ─────────────────────────────────────────────────────
+(async () => {
+  let supported = await arSupported();
+  if (!supported && IS_IOS && VL_KEY) {
+    setStatus("loading iOS AR bridge");
+    await loadVariantLaunch();
+    supported = await arSupported();
+  }
+  if (!supported && IS_IOS && !VL_KEY) {
+    iosNote.hidden = false;
+    iosNote.innerHTML =
+      "iPhone Safari has no WebXR yet: AR here needs a (free) " +
+      '<a href="https://launch.variant3d.com" target="_blank" rel="noreferrer">Variant Launch</a> ' +
+      "key for this domain (set <code>window.VL_KEY</code> in index.html). " +
+      "The 3D preview below runs the same physics + policies.";
+  }
+  btnAr.disabled = !supported;
+  if (!supported) btnAr.textContent = "AR not available";
+  btnPreview.disabled = false;
+  bootPromise.then(() => setStatus("ready"));
+})();
+
+btnAr.addEventListener("click", () => {
+  startAr().catch((err) => {
+    console.error("[xr]", err);
+    setStatus(`AR failed: ${err?.message || err}`);
+    overlay.classList.remove("live");
+    landing.style.display = "";
+  });
+});
+btnPreview.addEventListener("click", () => {
+  startPreview().catch((err) => {
+    console.error("[preview]", err);
+    setStatus(`preview failed: ${err?.message || err}`);
+  });
+});

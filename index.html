@@ -1,19 +1,172 @@
 <!doctype html>
-<html>
-	<head>
-		<meta charset="utf-8" />
-		<meta name="viewport" content="width=device-width" />
-		<title>My static Space</title>
-		<link rel="stylesheet" href="style.css" />
-	</head>
-	<body>
-		<div class="card">
-			<h1>Welcome to your static Space!</h1>
-			<p>You can modify this app directly by editing <i>index.html</i> in the Files and versions tab.</p>
-			<p>
-				Also don't forget to check the
-				<a href="https://huggingface.co/docs/hub/spaces" target="_blank">Spaces documentation</a>.
-			</p>
-		</div>
-	</body>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+    <title>Microduck AR</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🐤</text></svg>" />
+    <script>
+      // Variant Launch key: register the deployed domain at
+      // https://launch.variant3d.com to get one (free tier). It provides
+      // WebXR on iPhone via an App Clip. Leave empty to disable; the app
+      // still runs native WebXR on Android Chrome and 3D preview anywhere.
+      window.VL_KEY = "";
+    </script>
+    <style>
+      :root {
+        --ink: #08080c;
+        --paper: #f5f2ea;
+        --accent: #ffb52e;
+        --accent2: #ff7a2f;
+      }
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      html, body { height: 100%; }
+      body {
+        background: var(--ink);
+        color: var(--paper);
+        font-family: ui-monospace, "SF Mono", Menlo, monospace;
+        overflow: hidden;
+        touch-action: none;
+        -webkit-user-select: none;
+        user-select: none;
+      }
+      canvas { display: block; }
+
+      /* ── Landing ── */
+      #landing {
+        position: fixed; inset: 0; z-index: 20;
+        display: flex; flex-direction: column;
+        align-items: center; justify-content: center;
+        gap: 18px; padding: 24px; text-align: center;
+        background: radial-gradient(ellipse at 50% 30%, #16161e 0%, var(--ink) 70%);
+      }
+      #landing h1 {
+        font-size: clamp(36px, 9vw, 64px);
+        letter-spacing: 0.04em;
+        color: var(--accent);
+        text-transform: uppercase;
+        line-height: 1;
+      }
+      #landing p.sub {
+        max-width: 420px; font-size: 13px; line-height: 1.6; opacity: 0.75;
+      }
+      #status {
+        min-height: 1.4em; font-size: 12px; color: var(--accent);
+        opacity: 0.9; letter-spacing: 0.06em;
+      }
+      .btn {
+        appearance: none; border: 2px solid var(--paper);
+        background: transparent; color: var(--paper);
+        font: inherit; font-size: 15px; letter-spacing: 0.1em;
+        padding: 14px 30px; cursor: pointer; text-transform: uppercase;
+        border-radius: 4px;
+      }
+      .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--ink); font-weight: 700; }
+      .btn:disabled { opacity: 0.35; cursor: default; }
+      #ios-note { font-size: 11px; opacity: 0.55; max-width: 380px; line-height: 1.5; }
+      #landing a { color: var(--accent); }
+
+      /* ── In-session overlay ── */
+      #overlay { position: fixed; inset: 0; z-index: 10; display: none; pointer-events: none; }
+      #overlay.live { display: block; }
+      #hint {
+        position: absolute; top: max(14px, env(safe-area-inset-top)); left: 50%;
+        transform: translateX(-50%);
+        background: rgba(8, 8, 12, 0.65); color: var(--paper);
+        font-size: 12px; letter-spacing: 0.05em; padding: 8px 14px;
+        border-radius: 999px; white-space: nowrap;
+      }
+      #topbar {
+        position: absolute; top: max(14px, env(safe-area-inset-top));
+        right: 12px; display: flex; flex-direction: column; gap: 8px;
+        pointer-events: auto;
+      }
+      .chip {
+        appearance: none; border: 1px solid rgba(245, 242, 234, 0.5);
+        background: rgba(8, 8, 12, 0.55); color: var(--paper);
+        font: inherit; font-size: 11px; letter-spacing: 0.08em;
+        padding: 8px 12px; border-radius: 999px; cursor: pointer;
+        text-transform: uppercase; text-align: center;
+      }
+      .chip.down, .chip:active { background: var(--accent); color: var(--ink); }
+
+      /* Floating stick, lower-left quadrant */
+      #touch-zone {
+        position: absolute; left: 0; bottom: 0;
+        width: 50%; height: 55%; pointer-events: auto;
+      }
+      #touch-stick {
+        position: absolute; left: 24px; bottom: max(32px, env(safe-area-inset-bottom));
+        width: 110px; height: 110px; border-radius: 50%;
+        border: 2px solid rgba(245, 242, 234, 0.45);
+        background: rgba(8, 8, 12, 0.35);
+        pointer-events: none;
+      }
+      #touch-stick .nub {
+        position: absolute; left: 50%; top: 50%;
+        width: 48px; height: 48px; margin: -24px 0 0 -24px;
+        border-radius: 50%; background: rgba(245, 242, 234, 0.85);
+      }
+      #touch-stick.live { border-color: var(--accent); }
+      #touch-stick.live .nub { background: var(--accent); }
+
+      /* Action caps, lower-right */
+      #actions {
+        position: absolute; right: 20px; bottom: max(32px, env(safe-area-inset-bottom));
+        display: flex; align-items: flex-end; gap: 14px; pointer-events: auto;
+      }
+      .cap {
+        width: 64px; height: 64px; border-radius: 50%;
+        border: 2px solid rgba(245, 242, 234, 0.5);
+        background: rgba(8, 8, 12, 0.45); color: var(--paper);
+        font: inherit; font-size: 11px; letter-spacing: 0.06em;
+        cursor: pointer; text-transform: uppercase;
+      }
+      .cap.down { background: var(--accent); color: var(--ink); border-color: var(--accent); }
+      #btn-kick { width: 76px; height: 76px; font-size: 13px; }
+      #mode-tag {
+        position: absolute; left: 20px;
+        top: max(14px, env(safe-area-inset-top));
+        font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase;
+        color: var(--accent); background: rgba(8, 8, 12, 0.55);
+        padding: 8px 12px; border-radius: 999px;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="landing">
+      <h1>Microduck&nbsp;AR</h1>
+      <p class="sub">
+        The real Microduck RL policies (Pollen Robotics) stepping real MuJoCo
+        physics on your floor: WebAssembly physics + onnxruntime policy at
+        50&nbsp;Hz, no server. Scan the floor, tap to place, drive the duck.
+      </p>
+      <div id="status">booting&hellip;</div>
+      <button class="btn primary" id="btn-ar" disabled>Start AR</button>
+      <button class="btn" id="btn-preview" disabled>3D preview</button>
+      <p id="ios-note" hidden></p>
+    </div>
+
+    <div id="overlay">
+      <div id="hint">point your phone at the floor</div>
+      <div id="mode-tag" hidden>walk</div>
+      <div id="topbar">
+        <button class="chip" id="btn-exit">exit</button>
+        <button class="chip" id="btn-replace" hidden>move</button>
+        <button class="chip" id="btn-size" hidden>size 1x</button>
+        <button class="chip" id="btn-ball" hidden>ball</button>
+        <button class="chip" id="btn-reset" hidden>reset</button>
+      </div>
+      <div id="touch-zone" hidden>
+        <div id="touch-stick"><div class="nub"></div></div>
+      </div>
+      <div id="actions" hidden>
+        <button class="cap" id="btn-roll">roll</button>
+        <button class="cap" id="btn-quack">quack</button>
+        <button class="cap" id="btn-kick">kick</button>
+      </div>
+    </div>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
 </html>
