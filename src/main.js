@@ -23,7 +23,7 @@ import { signed } from "./signed.js";
 
 const $ = (id) => document.getElementById(id);
 const landing = $("landing"), statusEl = $("status");
-const overlay = $("overlay"), hint = $("hint"), modeTag = $("mode-tag");
+const overlay = $("overlay"), hint = $("hint"), modeTag = $("mode-tag"), areaTag = $("area-tag");
 const btnAr = $("btn-ar"), btnPreview = $("btn-preview"), iosNote = $("ios-note");
 
 const setStatus = (s) => { statusEl.textContent = s; };
@@ -130,6 +130,24 @@ const ballMesh = new THREE.Mesh(
 ballMesh.castShadow = true;
 ballMesh.visible = false;
 ballRoot.add(ballMesh);
+
+// Learned play-area boundary: a thin amber rectangle on the floor that
+// grows as scanning discovers more free floor (see floor learning below).
+const fenceLineGeom = new THREE.BufferGeometry();
+fenceLineGeom.setAttribute("position", new THREE.BufferAttribute(new Float32Array(12), 3));
+const fenceLine = new THREE.LineLoop(
+  fenceLineGeom,
+  new THREE.LineBasicMaterial({ color: 0xffb52e, transparent: true, opacity: 0.4 }),
+);
+fenceLine.position.y = 0.006;
+anchor.add(fenceLine);
+function updateFenceLine(f) {
+  const p = fenceLineGeom.attributes.position.array;
+  // MJCF (x, y) -> anchor-local (x, -y as z).
+  const x0 = f.cx - f.hx, x1 = f.cx + f.hx, z0 = -(f.cy - f.hy), z1 = -(f.cy + f.hy);
+  p.set([x0, 0, z0, x1, 0, z0, x1, 0, z1, x0, 0, z1]);
+  fenceLineGeom.attributes.position.needsUpdate = true;
+}
 
 // Reticle for floor placement.
 const reticle = new THREE.Mesh(
@@ -261,6 +279,7 @@ function showGameUi(v) {
   $("touch-zone").hidden = !v;
   $("actions").hidden = !v;
   modeTag.hidden = !v;
+  areaTag.hidden = !v;
   for (const c of gameChips) c.hidden = !v;
 }
 let kickFoot = "left";
@@ -276,9 +295,20 @@ bindButton($("btn-ball"), () => sim?.spawnBall());
 const SIZES = [1, 2, 3];
 let sizeIdx = 0;
 bindButton($("btn-size"), () => {
+  const prev = SIZES[sizeIdx];
   sizeIdx = (sizeIdx + 1) % SIZES.length;
-  anchor.scale.setScalar(SIZES[sizeIdx]);
-  $("btn-size").textContent = `size ${SIZES[sizeIdx]}x`;
+  const next = SIZES[sizeIdx];
+  anchor.scale.setScalar(next);
+  $("btn-size").textContent = `size ${next}x`;
+  // Learned floor bounds live in MJCF metres, i.e. physical metres divided
+  // by the visual scale: rescale them so the fence keeps matching the SAME
+  // physical floor at the new scale.
+  if (sim && floorBounds) {
+    const f = prev / next;
+    floorBounds.minx *= f; floorBounds.maxx *= f;
+    floorBounds.miny *= f; floorBounds.maxy *= f;
+    applyFence(fenceFromBounds());
+  }
 });
 
 // ── Placement ───────────────────────────────────────────────────────────
@@ -307,6 +337,48 @@ function hitStability(p) {
   return worst < HIT_STABLE_TOL;
 }
 let placing = false;
+
+// ── Floor size estimation ───────────────────────────────────────────────
+// iOS wrappers expose no plane or depth API, so the usable floor size is
+// learned by accumulation instead: after placement the viewer hit-test
+// keeps running, and every hit that lands on the placement plane expands
+// the play-area rectangle - physics fence walls (moved at runtime inside
+// MuJoCo), boundary line and the on-screen measurement all follow.
+const FLOOR_Y_TOL = 0.12; // m off the placement plane still counts as floor
+const FENCE_MIN = 0.6, FENCE_MAX = 2.5; // half-extents, MJCF metres
+let floorBounds = null;
+function fenceFromBounds() {
+  const cx = (floorBounds.minx + floorBounds.maxx) / 2;
+  const cy = (floorBounds.miny + floorBounds.maxy) / 2;
+  const hx = Math.min(FENCE_MAX, Math.max(FENCE_MIN, (floorBounds.maxx - floorBounds.minx) / 2));
+  const hy = Math.min(FENCE_MAX, Math.max(FENCE_MIN, (floorBounds.maxy - floorBounds.miny) / 2));
+  return { cx, cy, hx, hy };
+}
+function applyFence(f) {
+  sim.setFence(f.cx, f.cy, f.hx, f.hy);
+  updateFenceLine(f);
+  const s = SIZES[sizeIdx];
+  areaTag.textContent = `floor ~ ${(2 * f.hx * s).toFixed(1)} x ${(2 * f.hy * s).toFixed(1)} m`;
+}
+function resetFloorBounds() {
+  floorBounds = { minx: -FENCE_MIN, maxx: FENCE_MIN, miny: -FENCE_MIN, maxy: FENCE_MIN };
+  applyFence(fenceFromBounds());
+}
+const _fp = new THREE.Vector3();
+function learnFloorPoint(p) {
+  _fp.set(p.x, p.y, p.z);
+  anchor.worldToLocal(_fp); // includes the 1/scale, so bounds stay in MJCF metres
+  if (Math.abs(_fp.y) > FLOOR_Y_TOL) return; // a table/other level, not this floor
+  const mx = _fp.x, my = -_fp.z;
+  if (Math.abs(mx) > FENCE_MAX * 2 || Math.abs(my) > FENCE_MAX * 2) return;
+  const b = floorBounds;
+  const grew = mx < b.minx - 0.02 || mx > b.maxx + 0.02 || my < b.miny - 0.02 || my > b.maxy + 0.02;
+  if (!grew) return;
+  b.minx = Math.min(b.minx, mx); b.maxx = Math.max(b.maxx, mx);
+  b.miny = Math.min(b.miny, my); b.maxy = Math.max(b.maxy, my);
+  applyFence(fenceFromBounds());
+}
+
 const _hitPos = new THREE.Vector3();
 const _hitQuat = new THREE.Quaternion();
 const _hitScale = new THREE.Vector3();
@@ -332,8 +404,9 @@ function placeAnchorFromReticle() {
     lastHitResult.createAnchor().then((a) => { xrAnchor = a; }).catch(() => {});
   }
   sim.resetSim();
+  resetFloorBounds();
   sim.paused = false;
-  setHint("");
+  setHint("scan around to grow the play area");
   showGameUi(true);
 }
 bindButton($("btn-replace"), () => {
@@ -447,6 +520,10 @@ async function startPreview() {
   setHint("");
   showGameUi(true);
   sim.resetSim();
+  floorBounds = null; // no scanning in preview: fixed 2 x 2 m pen
+  sim.setFence(0, 0, 1, 1);
+  updateFenceLine(sim.fence);
+  areaTag.textContent = "floor 2.0 x 2.0 m";
   sim.paused = false;
 }
 function exitPreview() {
@@ -485,6 +562,15 @@ renderer.setAnimationLoop((t, frame) => {
       hitStable = false;
       hitHistory.length = 0;
       setHint("point your phone at the floor - move slowly");
+    }
+  }
+  // Floor learning: while playing, every hit-test on the placement plane
+  // grows the fence to the floor actually scanned.
+  if (frame && hitTestSource && !placing && anchor.visible && localSpace && floorBounds) {
+    const hits = frame.getHitTestResults(hitTestSource);
+    if (hits.length) {
+      const pose = hits[0].getPose(localSpace);
+      if (pose) learnFloorPoint(pose.transform.position);
     }
   }
   // Anchored play area: follow ARKit's corrected anchor pose so the duck

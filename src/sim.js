@@ -51,7 +51,10 @@ export const VEL_FWD = 0.25, VEL_BACK = -0.2, VEL_ANG = 1.0;
 export const BALL_RADIUS = 0.05;
 const BALL_PARK_POS = "50 0 0.05";
 // Invisible fence keeping duck + ball within reach of the placement spot.
+// This is only the boot value: setFence() re-sizes the compiled wall geoms
+// at runtime to the real floor area learned from AR hit-tests.
 export const FENCE_HALF = 1.0;
+const WALL_T = 0.025, WALL_H = 0.125;
 
 const KICK_STEPS = 25; // 0.5 s window
 const POST_KICK_LOCK_STEPS = 20;
@@ -98,7 +101,7 @@ export async function createSim({ onProgress = () => {}, getCommand }) {
     root.appendChild(el("option", { timestep: String(TIMESTEP) }));
     const world = doc.querySelector("worldbody");
     world.appendChild(el("geom", { name: "floor", type: "plane", size: "0 0 0.05", pos: "0 0 0" }));
-    const ht = 0.025, hh = 0.125;
+    const ht = WALL_T, hh = WALL_H;
     const off = FENCE_HALF + ht, span = FENCE_HALF + 0.05;
     for (const w of [
       { name: "wall_px", pos: `${off} 0 ${hh}`, size: `${ht} ${span} ${hh}` },
@@ -172,6 +175,27 @@ export async function createSim({ onProgress = () => {}, getCommand }) {
   const standKeyId = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY.value, "STAND");
   const ballQposAdr = model.jnt("ball_freejoint").qposadr;
   const ballDofAdr = model.jnt("ball_freejoint").dofadr;
+  const wallIds = Object.fromEntries(["wall_px", "wall_nx", "wall_py", "wall_ny"].map(
+    (n) => [n, mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM.value, n)],
+  ));
+
+  // ── Runtime fence: an axis-aligned rectangle in MJCF coordinates ──────
+  // Static geom pos/size live in the model and are read every step, so the
+  // walls can follow the floor area learned from AR scanning. Views are
+  // re-read on every call: WASM heap growth detaches TypedArrays.
+  const fence = { cx: 0, cy: 0, hx: FENCE_HALF, hy: FENCE_HALF };
+  function setFence(cx, cy, hx, hy) {
+    fence.cx = cx; fence.cy = cy; fence.hx = hx; fence.hy = hy;
+    const gp = model.geom_pos, gs = model.geom_size;
+    const set = (id, px, py, sx, sy) => {
+      gp[id * 3] = px; gp[id * 3 + 1] = py; gp[id * 3 + 2] = WALL_H;
+      gs[id * 3] = sx; gs[id * 3 + 1] = sy; gs[id * 3 + 2] = WALL_H;
+    };
+    set(wallIds.wall_px, cx + hx + WALL_T, cy, WALL_T, hy + 0.05);
+    set(wallIds.wall_nx, cx - hx - WALL_T, cy, WALL_T, hy + 0.05);
+    set(wallIds.wall_py, cx, cy + hy + WALL_T, hx + 0.05, WALL_T);
+    set(wallIds.wall_ny, cx, cy - hy - WALL_T, hx + 0.05, WALL_T);
+  }
 
   const lastAction = new Float32Array(NUM_JOINTS);
   const obs = new Float32Array(OBS_SIZE);
@@ -233,10 +257,10 @@ export async function createSim({ onProgress = () => {}, getCommand }) {
     );
     const heading = yaw + (Math.random() - 0.5) * 0.7;
     const dist = 0.35 + (Math.random() - 0.5) * 0.1;
-    const lim = FENCE_HALF - BALL_RADIUS - 0.05;
-    const clamp = (v) => Math.min(lim, Math.max(-lim, v));
-    qpos[ballQposAdr] = clamp(qpos[0] + Math.cos(heading) * dist);
-    qpos[ballQposAdr + 1] = clamp(qpos[1] + Math.sin(heading) * dist);
+    const m = BALL_RADIUS + 0.05;
+    const cl = (v, c, h) => Math.min(c + h - m, Math.max(c - h + m, v));
+    qpos[ballQposAdr] = cl(qpos[0] + Math.cos(heading) * dist, fence.cx, fence.hx);
+    qpos[ballQposAdr + 1] = cl(qpos[1] + Math.sin(heading) * dist, fence.cy, fence.hy);
     qpos[ballQposAdr + 2] = BALL_RADIUS + 0.02;
     qpos[ballQposAdr + 3] = 1; qpos[ballQposAdr + 4] = 0; qpos[ballQposAdr + 5] = 0; qpos[ballQposAdr + 6] = 0;
     for (let i = 0; i < 6; i++) qvel[ballDofAdr + i] = 0;
@@ -345,8 +369,8 @@ export async function createSim({ onProgress = () => {}, getCommand }) {
     // Ball escape watchdog.
     if (ballActive) {
       const q = data.qpos;
-      if (Math.abs(q[ballQposAdr]) > FENCE_HALF + 0.1 ||
-          Math.abs(q[ballQposAdr + 1]) > FENCE_HALF + 0.1) spawnBall();
+      if (Math.abs(q[ballQposAdr] - fence.cx) > fence.hx + 0.1 ||
+          Math.abs(q[ballQposAdr + 1] - fence.cy) > fence.hy + 0.1) spawnBall();
     }
 
     if (postKickLock > 0 && mode === "walk") postKickLock--;
@@ -446,6 +470,8 @@ export async function createSim({ onProgress = () => {}, getCommand }) {
     get paused() { return paused; },
     set paused(v) { paused = v; },
     get pickPhase() { return mode === "groundpick" ? pickRun?.phase ?? null : null; },
+    get fence() { return { ...fence }; },
+    setFence,
     resetSim, spawnBall, parkBallPhysics, triggerKick, triggerRoll, triggerGroundPick,
     onMode: (fn) => listeners.mode.push(fn),
     destroy: () => { running = false; },

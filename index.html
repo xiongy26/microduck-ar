@@ -131,6 +131,13 @@
         color: var(--accent); background: rgba(8, 8, 12, 0.55);
         padding: 8px 12px; border-radius: 999px;
       }
+      #area-tag {
+        position: absolute; left: 20px;
+        top: calc(max(14px, env(safe-area-inset-top)) + 38px);
+        font-size: 10px; letter-spacing: 0.08em;
+        color: rgba(245, 242, 234, 0.8); background: rgba(8, 8, 12, 0.55);
+        padding: 6px 10px; border-radius: 999px;
+      }
     </style>
   </head>
   <body>
@@ -150,6 +157,7 @@
     <div id="overlay">
       <div id="hint">point your phone at the floor</div>
       <div id="mode-tag" hidden>walk</div>
+      <div id="area-tag" hidden></div>
       <div id="topbar">
         <button class="chip" id="btn-exit">exit</button>
         <button class="chip" id="btn-replace" hidden>move</button>
