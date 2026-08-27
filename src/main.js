@@ -282,6 +282,30 @@ bindButton($("btn-size"), () => {
 });
 
 // ── Placement ───────────────────────────────────────────────────────────
+// Stability gate: ARKit's first hit-tests come from rough estimated planes
+// (that's what reads as "wrong distance/size"). Placement only unlocks
+// once the last N hit points agree within a few cm - i.e. the tracker has
+// locked a real plane.
+const HIT_STABLE_N = 12;
+const HIT_STABLE_TOL = 0.035; // m of spread across the window
+const hitHistory = [];
+let hitStable = false;
+let lastHitResult = null; // XRHitTestResult, for anchor creation
+let xrAnchor = null; // XRAnchor pinning the play area while tracking refines
+let anchorYaw = 0;
+function hitStability(p) {
+  hitHistory.push([p.x, p.y, p.z]);
+  if (hitHistory.length > HIT_STABLE_N) hitHistory.shift();
+  if (hitHistory.length < HIT_STABLE_N) return false;
+  let mx = 0, my = 0, mz = 0;
+  for (const h of hitHistory) { mx += h[0]; my += h[1]; mz += h[2]; }
+  mx /= hitHistory.length; my /= hitHistory.length; mz /= hitHistory.length;
+  let worst = 0;
+  for (const h of hitHistory) {
+    worst = Math.max(worst, Math.hypot(h[0] - mx, h[1] - my, h[2] - mz));
+  }
+  return worst < HIT_STABLE_TOL;
+}
 let placing = false;
 const _hitPos = new THREE.Vector3();
 const _hitQuat = new THREE.Quaternion();
@@ -294,10 +318,19 @@ function placeAnchorFromReticle() {
   camera.getWorldPosition(_camPos);
   const dx = _camPos.x - _hitPos.x, dz = _camPos.z - _hitPos.z;
   const n = Math.hypot(dx, dz) || 1;
-  anchor.rotation.set(0, Math.atan2(-dz / n, dx / n), 0);
+  anchorYaw = Math.atan2(-dz / n, dx / n);
+  anchor.rotation.set(0, anchorYaw, 0);
   anchor.visible = true;
   placing = false;
   reticle.visible = false;
+  // Pin the play area to an ARKit anchor when the platform offers one:
+  // as tracking refines its world map, the anchor pose is corrected and
+  // the duck stays glued to the real floor instead of drifting with the
+  // session origin.
+  xrAnchor = null;
+  if (lastHitResult?.createAnchor) {
+    lastHitResult.createAnchor().then((a) => { xrAnchor = a; }).catch(() => {});
+  }
   sim.resetSim();
   sim.paused = false;
   setHint("");
@@ -305,6 +338,9 @@ function placeAnchorFromReticle() {
 }
 bindButton($("btn-replace"), () => {
   placing = true;
+  hitHistory.length = 0;
+  hitStable = false;
+  xrAnchor = null;
   sim.paused = true;
   showGameUi(false);
   setHint("point at the floor, tap to move the duck");
@@ -320,9 +356,15 @@ async function startAr() {
   const overlayRoot = overlay;
   xrSession = await navigator.xr.requestSession("immersive-ar", {
     requiredFeatures: ["hit-test"],
-    optionalFeatures: ["dom-overlay", "local-floor", "light-estimation"],
+    // anchors: pin the play area against tracking drift (Variant Launch
+    // and ARCore both offer them). depth-sensing: real-world occlusion,
+    // granted on Android Chrome (three renders the occlusion automatically);
+    // iOS wrappers don't expose depth yet.
+    optionalFeatures: ["dom-overlay", "local-floor", "anchors", "depth-sensing", "light-estimation"],
+    depthSensing: { usagePreference: ["gpu-optimized"], dataFormatPreference: ["luminance-alpha"] },
     domOverlay: { root: overlayRoot },
   });
+  console.log("[xr] granted features:", [...(xrSession.enabledFeatures ?? [])].join(", ") || "unknown");
   // Touches on the control overlay must not double as AR select taps.
   overlayRoot.addEventListener("beforexrselect", (e) => e.preventDefault());
   landing.style.display = "none";
@@ -330,26 +372,34 @@ async function startAr() {
   showGameUi(false);
   setHint("point your phone at the floor");
   placing = true;
+  hitHistory.length = 0;
+  hitStable = false;
+  xrAnchor = null;
   anchor.visible = false;
   anchor.scale.setScalar(SIZES[sizeIdx]);
 
-  renderer.xr.setReferenceSpaceType("local-floor");
+  // Probe the reference space before handing the session to three:
+  // Variant Launch only implements "local", Chrome grants "local-floor".
+  let refType = "local-floor";
   try {
-    await renderer.xr.setSession(xrSession);
+    await xrSession.requestReferenceSpace("local-floor");
   } catch {
-    renderer.xr.setReferenceSpaceType("local");
-    await renderer.xr.setSession(xrSession);
+    refType = "local";
   }
+  renderer.xr.setReferenceSpaceType(refType);
+  await renderer.xr.setSession(xrSession);
   localSpace = renderer.xr.getReferenceSpace();
   const viewerSpace = await xrSession.requestReferenceSpace("viewer");
   hitTestSource = await xrSession.requestHitTestSource({ space: viewerSpace });
 
   xrSession.addEventListener("select", () => {
-    if (placing && reticle.visible) placeAnchorFromReticle();
+    if (placing && reticle.visible && hitStable) placeAnchorFromReticle();
   });
   xrSession.addEventListener("end", () => {
     xrSession = null;
     hitTestSource = null;
+    xrAnchor = null;
+    lastHitResult = null;
     sim.paused = true;
     overlay.classList.remove("live");
     landing.style.display = "";
@@ -420,14 +470,34 @@ renderer.setAnimationLoop((t, frame) => {
     if (hits.length) {
       const pose = hits[0].getPose(localSpace);
       if (pose) {
+        lastHitResult = hits[0];
         reticle.visible = true;
         reticle.matrix.fromArray(pose.transform.matrix);
-        setHint("tap to place the duck");
+        hitStable = hitStability(pose.transform.position);
+        reticle.material.color.setHex(hitStable ? 0xffb52e : 0x8a8a95);
+        reticle.material.opacity = hitStable ? 0.95 : 0.5;
+        setHint(hitStable
+          ? "tap to place the duck"
+          : "scanning the floor - sweep the phone slowly");
       }
     } else {
       reticle.visible = false;
+      hitStable = false;
+      hitHistory.length = 0;
       setHint("point your phone at the floor - move slowly");
     }
+  }
+  // Anchored play area: follow ARKit's corrected anchor pose so the duck
+  // stays on the real floor while the world map refines.
+  if (frame && xrAnchor && anchor.visible && localSpace) {
+    try {
+      const pose = frame.getPose(xrAnchor.anchorSpace, localSpace);
+      if (pose) {
+        const p = pose.transform.position;
+        anchor.position.set(p.x, p.y, p.z);
+        anchor.rotation.set(0, anchorYaw, 0);
+      }
+    } catch { /* anchor deleted by the system */ }
   }
   syncFromSim();
   if (previewOn && controls) controls.update();
