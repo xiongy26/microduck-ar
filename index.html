@@ -5,6 +5,11 @@
     <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
     <title>Microduck AR</title>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🐤</text></svg>" />
+    <!-- Anton: the display face of pollen-robotics.com/microduck, used by
+         the pre-order button to match the store's comic style. -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Anton&display=swap" rel="stylesheet" />
     <script>
       // Variant Launch key: register the deployed domain at
       // https://launch.variant3d.com to get one (free tier). It provides
@@ -90,6 +95,25 @@
       }
       .chip.down, .chip:active { background: var(--accent); color: var(--ink); }
 
+      /* Pre-order button: lifted 1:1 from pollen-robotics.com/microduck
+         (their small comic button: Anton, orange fill, hard 3px ink
+         border, square corners, brightness hover, 1px press shove). */
+      .buy-btn {
+        display: inline-flex; align-items: center; justify-content: center;
+        gap: 0.55em; box-sizing: border-box;
+        font-family: "Anton", ui-monospace, sans-serif;
+        font-size: 0.85rem; line-height: 1.15; white-space: nowrap;
+        letter-spacing: 0.07em; text-transform: uppercase;
+        text-decoration: none; text-align: center;
+        padding: 8px 18px; border: 3px solid #101018; border-radius: 0;
+        background: #ff7a2f; color: #101018;
+        cursor: pointer; user-select: none; -webkit-tap-highlight-color: transparent;
+        transition: transform 0.12s ease, filter 0.12s ease;
+      }
+      .buy-btn:hover { filter: brightness(1.12); }
+      .buy-btn:active { transform: translate(1px, 1px); }
+      .buy-btn:focus-visible { outline: 3px dashed #101018; outline-offset: 5px; }
+
       /* Floating stick, lower-left quadrant */
       #touch-zone {
         position: absolute; left: 0; bottom: 0;
@@ -164,6 +188,10 @@
         <button class="chip" id="btn-size" hidden>size 1x</button>
         <button class="chip" id="btn-ball" hidden>ball</button>
         <button class="chip" id="btn-reset" hidden>reset</button>
+        <a class="buy-btn" id="btn-buy" hidden
+           href="https://store.pollen-robotics.com/products/microduck"
+           target="_blank" rel="noopener noreferrer"
+           aria-label="Pre-order the Microduck">Pre-order</a>
       </div>
       <div id="touch-zone" hidden>
         <div id="touch-stick"><div class="nub"></div></div>

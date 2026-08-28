@@ -274,7 +274,7 @@ function syncFromSim() {
 }
 
 // ── Session UI wiring ───────────────────────────────────────────────────
-const gameChips = [$("btn-reset"), $("btn-ball"), $("btn-size"), $("btn-replace")];
+const gameChips = [$("btn-reset"), $("btn-ball"), $("btn-size"), $("btn-replace"), $("btn-buy")];
 function showGameUi(v) {
   $("touch-zone").hidden = !v;
   $("actions").hidden = !v;
