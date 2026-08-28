@@ -592,8 +592,15 @@ renderer.setAnimationLoop((t, frame) => {
 
 // ── Landing buttons ─────────────────────────────────────────────────────
 (async () => {
+  const ua = navigator.userAgent;
+  const IS_ANDROID = /Android/i.test(ua);
+  // iOS browsers are all WebKit, but only real Safari can hand off to the
+  // App Clip; in-app webviews and Chrome/Firefox/Edge skins can't - and the
+  // VL SDK must NOT load there (redirect=true would navigate them away).
+  const iosNotSafari = IS_IOS &&
+    /CriOS|FxiOS|EdgiOS|OPiOS|OPT\/|GSA\/|Instagram|FBAN|FBAV|Snapchat|Twitter|Line\//i.test(ua);
   let supported = await arSupported();
-  if (!supported && IS_IOS && VL_KEY) {
+  if (!supported && IS_IOS && !iosNotSafari && VL_KEY) {
     setStatus("loading iOS AR bridge");
     await loadVariantLaunch();
     supported = await arSupported();
@@ -607,7 +614,16 @@ renderer.setAnimationLoop((t, frame) => {
       "The 3D preview below runs the same physics + policies.";
   }
   btnAr.disabled = !supported;
-  if (!supported) btnAr.textContent = "AR not available";
+  if (!supported) {
+    const androidChrome = /Chrome\/\d/.test(ua) &&
+      !/EdgA|OPR\/|SamsungBrowser|Firefox|UCBrowser|DuckDuckGo/i.test(ua);
+    btnAr.textContent =
+      iosNotSafari ? "AR only available on Safari"
+      : IS_ANDROID && !androidChrome ? "AR only available on Chrome"
+      : IS_IOS ? "AR not available"
+      : /Windows|Macintosh|X11|Linux/.test(ua) ? "AR not available on desktop"
+      : "AR not available on this platform";
+  }
   btnPreview.disabled = false;
   bootPromise.then(() => setStatus("ready"));
 })();
