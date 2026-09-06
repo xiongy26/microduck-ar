@@ -12,6 +12,22 @@
 > **This repository is a fork/modification of the original project above.**
 > The original remote is preserved as `huggingface` in the local git config.
 
+## 🎬 效果预览 / Demo Video
+
+观看实际效果（视频里包含放置小鸭、悬浮摇杆操控、AR 真实地面追踪、踢沙滩球、摔倒自动恢复等场景）：
+
+- **B 站**：[https://www.bilibili.com/video/BV18sbp6xE9P](https://www.bilibili.com/video/BV18sbp6xE9P?spm_id_from=333.1387.upload.video_card.click&vd_source=b0c8a11b5de94ddafb7aba6365bcceef)
+
+如果你的 Markdown 渲染器支持 iframe（例如 GitHub Pages、自建站点、Notion 等），可以直接嵌入播放器：
+
+```html
+<iframe src="https://player.bilibili.com/player.html?bvid=BV18sbp6xE9P&autoplay=0"
+        width="100%" height="540" scrolling="no" frameborder="0"
+        allowfullscreen="true"></iframe>
+```
+
+> GitHub 的 README 出于安全策略会剥离 `iframe`，所以在 GitHub 仓库首页请直接点上面的链接观看。
+
 ## 本仓库相对原项目的修改
 
 相对 [原项目](https://huggingface.co/spaces/multimodalart/microduck-ar) 的主要改动：
