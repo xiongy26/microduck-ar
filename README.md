@@ -1,5 +1,27 @@
 # Microduck AR 运行指南
 
+> 📌 **项目来源 / Source**
+>
+> 本仓库基于以下公开项目修改而来：
+>
+> **原仓库地址**：[https://huggingface.co/spaces/multimodalart/microduck-ar](https://huggingface.co/spaces/multimodalart/microduck-ar)
+>
+> 原仓库已作为 `huggingface` remote 保留在本地 git 配置中（`git remote -v` 可查看）。
+> 本仓库在此基础上做了二次开发（详见下方"本仓库相对原项目的修改"）。
+>
+> **This repository is a fork/modification of the original project above.**
+> The original remote is preserved as `huggingface` in the local git config.
+
+## 本仓库相对原项目的修改
+
+相对 [原项目](https://huggingface.co/spaces/multimodalart/microduck-ar) 的主要改动：
+
+- 一键启动脚本 [`start.sh`](start.sh)：把环境检查、LFS 提示、端口占用、依赖安装、`EMFILE` 自动回退、本机/局域网/隧道地址打印串成一条命令
+- VR 界面优化
+- 平台感知的 AR 可用性提示；Safari 之外不加载 Variant Launch SDK
+- Pollen 风格的"预购"按钮（位于重置按钮下方）
+- 地面尺寸估计：学习到的可玩区域 + 运行时边界墙 + 边界与面积读数
+
 ## 项目简介
 
 在浏览器里让 **Microduck 小鸭机器人**走在你家真实的地板上：真实的 MuJoCo 物理引擎（WebAssembly）+ 真实训练好的强化学习策略（onnxruntime-web，50 Hz 推理），运行在 WebXR `immersive-ar` 会话中。扫描地面 → 点击放置约 25 cm 真实比例的小鸭 → 用悬浮摇杆驱动它走路、踢球、叫。
