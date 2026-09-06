@@ -25,6 +25,7 @@ const $ = (id) => document.getElementById(id);
 const landing = $("landing"), statusEl = $("status");
 const overlay = $("overlay"), hint = $("hint"), modeTag = $("mode-tag"), areaTag = $("area-tag");
 const btnAr = $("btn-ar"), btnPreview = $("btn-preview"), iosNote = $("ios-note");
+const btnForcePlace = $("btn-force-place");
 
 const setStatus = (s) => { statusEl.textContent = s; };
 const setHint = (s) => { hint.textContent = s; hint.style.display = s ? "" : "none"; };
@@ -383,32 +384,74 @@ const _hitPos = new THREE.Vector3();
 const _hitQuat = new THREE.Quaternion();
 const _hitScale = new THREE.Vector3();
 const _camPos = new THREE.Vector3();
-function placeAnchorFromReticle() {
-  reticle.matrix.decompose(_hitPos, _hitQuat, _hitScale);
-  anchor.position.copy(_hitPos);
+const _camForward = new THREE.Vector3();
+const FORCE_FLOOR_DROP = 1.2;
+const FORCE_FALLBACK_DISTANCE = 0.9;
+
+function finishPlacement(position, hitResult = null, approximate = false) {
+  anchor.position.copy(position);
   // Face the duck (local +X) toward the viewer.
   camera.getWorldPosition(_camPos);
-  const dx = _camPos.x - _hitPos.x, dz = _camPos.z - _hitPos.z;
+  const dx = _camPos.x - position.x, dz = _camPos.z - position.z;
   const n = Math.hypot(dx, dz) || 1;
   anchorYaw = Math.atan2(-dz / n, dx / n);
   anchor.rotation.set(0, anchorYaw, 0);
   anchor.visible = true;
   placing = false;
   reticle.visible = false;
+  btnForcePlace.hidden = true;
+  btnForcePlace.disabled = true;
   // Pin the play area to an ARKit anchor when the platform offers one:
   // as tracking refines its world map, the anchor pose is corrected and
   // the duck stays glued to the real floor instead of drifting with the
   // session origin.
   xrAnchor = null;
-  if (lastHitResult?.createAnchor) {
-    lastHitResult.createAnchor().then((a) => { xrAnchor = a; }).catch(() => {});
+  if (hitResult?.createAnchor) {
+    hitResult.createAnchor().then((a) => { xrAnchor = a; }).catch(() => {});
   }
   sim.resetSim();
   resetFloorBounds();
   sim.paused = false;
-  setHint("scan around to grow the play area");
+  setHint(approximate
+    ? "placed on an estimated floor - use MOVE to adjust"
+    : "scan around to grow the play area");
   showGameUi(true);
 }
+
+function placeAnchorFromReticle() {
+  if (!placing || !reticle.visible) return;
+  reticle.matrix.decompose(_hitPos, _hitQuat, _hitScale);
+  finishPlacement(_hitPos, lastHitResult);
+}
+
+// Last-resort placement when WebXR has not found a surface. local-floor
+// gives us a real y=0 floor; wrappers that only expose local space need an
+// approximate floor 1.2 m below the phone. In both cases the camera ray is
+// intersected with that horizontal plane so aiming down chooses the spot.
+function placeAnchorFromCamera() {
+  if (!placing) return;
+  camera.getWorldPosition(_camPos);
+  camera.getWorldDirection(_camForward).normalize();
+  const floorY = xrRefType === "local-floor" ? 0 : _camPos.y - FORCE_FLOOR_DROP;
+  const rayDistance = (floorY - _camPos.y) / _camForward.y;
+
+  if (_camForward.y < -0.1 && rayDistance >= 0.3 && rayDistance <= 3) {
+    _hitPos.copy(_camPos).addScaledVector(_camForward, rayDistance);
+  } else {
+    // If the phone is level/upward, put the duck a short distance ahead.
+    _camForward.y = 0;
+    if (_camForward.lengthSq() < 1e-4) _camForward.set(0, 0, -1);
+    _camForward.normalize();
+    _hitPos.copy(_camPos).addScaledVector(_camForward, FORCE_FALLBACK_DISTANCE);
+    _hitPos.y = floorY;
+  }
+  finishPlacement(_hitPos, null, true);
+}
+
+bindButton(btnForcePlace, () => {
+  if (reticle.visible) placeAnchorFromReticle();
+  else placeAnchorFromCamera();
+});
 bindButton($("btn-replace"), () => {
   placing = true;
   hitHistory.length = 0;
@@ -416,13 +459,16 @@ bindButton($("btn-replace"), () => {
   xrAnchor = null;
   sim.paused = true;
   showGameUi(false);
-  setHint("point at the floor, tap to move the duck");
+  btnForcePlace.hidden = false;
+  btnForcePlace.disabled = false;
+  setHint("point at the floor, or tap PLACE NOW");
 });
 
 // ── AR session ──────────────────────────────────────────────────────────
 let xrSession = null;
 let hitTestSource = null;
 let localSpace = null;
+let xrRefType = "local";
 
 async function startAr() {
   await bootPromise;
@@ -443,23 +489,25 @@ async function startAr() {
   landing.style.display = "none";
   overlay.classList.add("live");
   showGameUi(false);
-  setHint("point your phone at the floor");
+  setHint("point at the floor, or tap PLACE NOW");
   placing = true;
   hitHistory.length = 0;
   hitStable = false;
   xrAnchor = null;
   anchor.visible = false;
   anchor.scale.setScalar(SIZES[sizeIdx]);
+  btnForcePlace.hidden = false;
+  btnForcePlace.disabled = false;
 
   // Probe the reference space before handing the session to three:
   // Variant Launch only implements "local", Chrome grants "local-floor".
-  let refType = "local-floor";
+  xrRefType = "local-floor";
   try {
     await xrSession.requestReferenceSpace("local-floor");
   } catch {
-    refType = "local";
+    xrRefType = "local";
   }
-  renderer.xr.setReferenceSpaceType(refType);
+  renderer.xr.setReferenceSpaceType(xrRefType);
   await renderer.xr.setSession(xrSession);
   localSpace = renderer.xr.getReferenceSpace();
   const viewerSpace = await xrSession.requestReferenceSpace("viewer");
@@ -473,6 +521,8 @@ async function startAr() {
     hitTestSource = null;
     xrAnchor = null;
     lastHitResult = null;
+    btnForcePlace.hidden = true;
+    btnForcePlace.disabled = true;
     sim.paused = true;
     overlay.classList.remove("live");
     landing.style.display = "";
@@ -555,13 +605,15 @@ renderer.setAnimationLoop((t, frame) => {
         reticle.material.opacity = hitStable ? 0.95 : 0.5;
         setHint(hitStable
           ? "tap to place the duck"
-          : "scanning the floor - sweep the phone slowly");
+          : "hold steady or tap PLACE NOW");
+      } else {
+        reticle.visible = false;
       }
     } else {
       reticle.visible = false;
       hitStable = false;
       hitHistory.length = 0;
-      setHint("point your phone at the floor - move slowly");
+      setHint("no surface found - PLACE NOW uses an estimated floor");
     }
   }
   // Floor learning: while playing, every hit-test on the placement plane

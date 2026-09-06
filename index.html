@@ -94,6 +94,14 @@
         text-transform: uppercase; text-align: center;
       }
       .chip.down, .chip:active { background: var(--accent); color: var(--ink); }
+      .chip:disabled { opacity: 0.4; cursor: default; }
+      #btn-force-place {
+        border-color: var(--accent); color: var(--accent);
+        background: rgba(8, 8, 12, 0.72);
+      }
+      #btn-force-place.down, #btn-force-place:active {
+        background: var(--accent); color: var(--ink);
+      }
 
       /* Pre-order button: lifted 1:1 from pollen-robotics.com/microduck
          (their small comic button: Anton, orange fill, hard 3px ink
@@ -184,6 +192,7 @@
       <div id="area-tag" hidden></div>
       <div id="topbar">
         <button class="chip" id="btn-exit">exit</button>
+        <button class="chip" id="btn-force-place" hidden>place now</button>
         <button class="chip" id="btn-replace" hidden>move</button>
         <button class="chip" id="btn-size" hidden>size 1x</button>
         <button class="chip" id="btn-ball" hidden>ball</button>
