@@ -59,6 +59,10 @@ CLEANED=0
 cleanup() {
   (( CLEANED )) && return          # EXIT 与 INT/TERM 会重复触发，只清理一次
   CLEANED=1
+  # If a preflight check failed, PIDS is empty and there is no child process
+  # owned by this script to stop. Do not claim that an unrelated port holder
+  # was terminated.
+  ((${#PIDS[@]})) || return
   local p
   for p in "${PIDS[@]:-}"; do
     [[ -n "$p" ]] && pkill -P "$p" 2>/dev/null   # 先收孙进程（vite/cloudflared 有子进程）
@@ -95,6 +99,7 @@ fi
 # 端口占用
 if ss -ltn 2>/dev/null | grep -q ":$PORT "; then
   c_err "端口 $PORT 已被占用。换一个：./start.sh --port 5300"
+  c_warn "占用端口的服务不属于本脚本，本次不会自动终止它"
   exit 1
 fi
 c_ok "端口 $PORT 空闲"

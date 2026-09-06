@@ -20,12 +20,18 @@ import {
 } from "./sim.js";
 import { Joystick, bindButton } from "./joystick.js";
 import { signed } from "./signed.js";
+import {
+  RECORDING_FPS, MAX_RECORDING_MS,
+  createMediaRecorder, downloadRecording, formatRecordingDuration,
+  recordingFileName,
+} from "./recording.js";
 
 const $ = (id) => document.getElementById(id);
 const landing = $("landing"), statusEl = $("status");
 const overlay = $("overlay"), hint = $("hint"), modeTag = $("mode-tag"), areaTag = $("area-tag");
 const btnAr = $("btn-ar"), btnPreview = $("btn-preview"), iosNote = $("ios-note");
-const btnForcePlace = $("btn-force-place");
+const btnForcePlace = $("btn-force-place"), btnReplace = $("btn-replace");
+const btnRecord = $("btn-record");
 
 const setStatus = (s) => { statusEl.textContent = s; };
 const setHint = (s) => { hint.textContent = s; hint.style.display = s ? "" : "none"; };
@@ -69,6 +75,49 @@ document.body.appendChild(renderer.domElement);
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.01, 40);
 camera.position.set(0.7, 0.5, 0.9);
+
+// Raw camera textures are GPU-only WebXR textures. The recorder renders a
+// synchronized camera background plus the world scene into the renderer's
+// default framebuffer, then copies the selected XR view into this ordinary
+// 2D canvas. That keeps captureStream GPU-backed and avoids a per-frame
+// readPixels stall on mobile.
+const recordingCanvas = document.createElement("canvas");
+recordingCanvas.id = "recording-canvas";
+recordingCanvas.hidden = true;
+document.body.appendChild(recordingCanvas);
+const recordingContext = recordingCanvas.getContext("2d", { alpha: false });
+const recordingBackgroundScene = new THREE.Scene();
+const recordingBackgroundCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+const recordingBackgroundMaterial = new THREE.ShaderMaterial({
+  uniforms: {
+    cameraTexture: { value: null },
+    uvScale: { value: new THREE.Vector2(1, 1) },
+  },
+  vertexShader: `
+    varying vec2 vUv;
+    void main() {
+      vUv = uv;
+      gl_Position = vec4(position.xy, 0.0, 1.0);
+    }
+  `,
+  fragmentShader: `
+    uniform sampler2D cameraTexture;
+    uniform vec2 uvScale;
+    varying vec2 vUv;
+    void main() {
+      vec2 uv = (vUv - 0.5) * uvScale + 0.5;
+      gl_FragColor = vec4(texture2D(cameraTexture, uv).rgb, 1.0);
+    }
+  `,
+  depthTest: false,
+  depthWrite: false,
+  toneMapped: false,
+});
+const recordingBackground = new THREE.Mesh(
+  new THREE.PlaneGeometry(2, 2),
+  recordingBackgroundMaterial,
+);
+recordingBackgroundScene.add(recordingBackground);
 
 window.addEventListener("resize", () => {
   camera.aspect = innerWidth / innerHeight;
@@ -275,7 +324,323 @@ function syncFromSim() {
 }
 
 // ── Session UI wiring ───────────────────────────────────────────────────
-const gameChips = [$("btn-reset"), $("btn-ball"), $("btn-size"), $("btn-replace"), $("btn-buy")];
+const gameChips = [
+  $("btn-reset"), $("btn-ball"), $("btn-size"), $("btn-replace"),
+  $("btn-buy"), btnRecord,
+];
+
+let recording = {
+  pending: false,
+  pendingFrames: 0,
+  recorder: null,
+  stream: null,
+  chunks: [],
+  mimeType: "video/mp4",
+  startedAt: 0,
+  lastFrameAt: -Infinity,
+  stopping: false,
+  stopMessage: "",
+  failed: false,
+  finalized: false,
+};
+
+function setRecordButton() {
+  const active = recording.recorder?.state === "recording";
+  btnRecord.classList.toggle("recording", active);
+  btnRecord.classList.toggle("pending", recording.pending);
+  btnRecord.disabled = recording.stopping;
+  btnRecord.textContent = active
+    ? `STOP ${formatRecordingDuration(performance.now() - recording.startedAt)}`
+    : recording.pending ? "REC ..." : "REC";
+  btnRecord.setAttribute("aria-label", active ? "Stop recording" : "Record AR video");
+}
+
+function releaseRecordingTracks() {
+  recording.stream?.getTracks().forEach((track) => track.stop());
+  recording.stream = null;
+}
+
+function finishRecording({ download = true, message = "" } = {}) {
+  if (recording.finalized) return;
+  recording.finalized = true;
+  const current = recording;
+  releaseRecordingTracks();
+
+  let saved = false;
+  if (download && current.chunks.length) {
+    try {
+      saved = downloadRecording(current.chunks, {
+        filename: recordingFileName(),
+        mimeType: current.mimeType,
+      });
+    } catch (err) {
+      console.error("[recording] download", err);
+      message = `recording save failed: ${err?.message || err}`;
+    }
+  }
+
+  recording = {
+    pending: false,
+    pendingFrames: 0,
+    recorder: null,
+    stream: null,
+    chunks: [],
+    mimeType: "video/mp4",
+    startedAt: 0,
+    lastFrameAt: -Infinity,
+    stopping: false,
+    stopMessage: "",
+    failed: false,
+    finalized: false,
+  };
+  recordingBackgroundMaterial.uniforms.cameraTexture.value = null;
+  btnReplace.disabled = false;
+  setRecordButton();
+
+  if (message && saved) setHint(`${message}; recording saved to Downloads`);
+  else if (message) setHint(message);
+  else if (saved) setHint("recording saved to Downloads");
+  else if (download) setHint("recording was empty - nothing downloaded");
+}
+
+function failRecording(message) {
+  const current = recording;
+  current.failed = true;
+  current.pending = false;
+  if (current.recorder && current.recorder.state !== "inactive") {
+    try { current.recorder.stop(); } catch { /* already stopped */ }
+  }
+  finishRecording({ download: false, message });
+}
+
+function requestRecording() {
+  if (recording.pending || recording.recorder) return;
+  if (!xrSession || !renderer.xr.isPresenting) {
+    setHint("recording needs AR camera access - use Android system screen recording");
+    return;
+  }
+  if (!recordingContext || typeof recordingCanvas.captureStream !== "function") {
+    setHint("canvas recording is unavailable - use Android system screen recording");
+    return;
+  }
+  if (!(xrSession.enabledFeatures || []).includes("camera-access")) {
+    setHint("camera access was not granted - use Android system screen recording");
+    return;
+  }
+  recording.pending = true;
+  recording.pendingFrames = 0;
+  recording.finalized = false;
+  btnReplace.disabled = true;
+  setRecordButton();
+  setHint("preparing camera recording...");
+}
+
+function stopRecording(message = "") {
+  if (recording.pending && !recording.recorder) {
+    recording.pending = false;
+    recording.finalized = true;
+    btnReplace.disabled = false;
+    setRecordButton();
+    if (message) setHint(message);
+    return;
+  }
+  const recorder = recording.recorder;
+  if (!recorder) return;
+  if (recording.stopping) return;
+  recording.stopping = true;
+  recording.stopMessage = message;
+  setRecordButton();
+  if (recorder.state === "recording" || recorder.state === "paused") {
+    try {
+      recorder.stop();
+    } catch (err) {
+      finishRecording({ download: false, message: `recording stop failed: ${err?.message || err}` });
+    }
+  } else {
+    finishRecording({ download: !recording.failed, message });
+  }
+}
+
+function beginRecording(timestamp) {
+  let stream;
+  let created;
+  try {
+    stream = recordingCanvas.captureStream(RECORDING_FPS);
+    created = createMediaRecorder(stream);
+  } catch (err) {
+    stream?.getTracks().forEach((track) => track.stop());
+    failRecording(`recording unavailable: ${err?.message || err}`);
+    return false;
+  }
+
+  recording.stream = stream;
+  recording.recorder = created.recorder;
+  recording.mimeType = created.mimeType;
+  recording.chunks = [];
+  recording.startedAt = timestamp;
+  recording.lastFrameAt = -Infinity;
+  recording.stopping = false;
+  recording.stopMessage = "";
+  recording.failed = false;
+  recording.finalized = false;
+  recording.pending = false;
+  const activeRecording = recording;
+  recording.recorder.ondataavailable = (event) => {
+    if (recording !== activeRecording) return;
+    if (event.data?.size) activeRecording.chunks.push(event.data);
+  };
+  recording.recorder.onstop = () => {
+    if (recording !== activeRecording) return;
+    finishRecording({ download: !activeRecording.failed, message: activeRecording.stopMessage });
+  };
+  recording.recorder.onerror = (event) => {
+    if (recording !== activeRecording) return;
+    const reason = event.error?.message || "encoder error";
+    activeRecording.failed = true;
+    try {
+      if (activeRecording.recorder.state !== "inactive") activeRecording.recorder.stop();
+    } catch { /* onstop may still be dispatched */ }
+    finishRecording({ download: false, message: `recording failed: ${reason}` });
+  };
+
+  try {
+    // A timeslice keeps encoded data flowing in bounded chunks instead of
+    // retaining the entire 60-second recording in the encoder.
+    recording.recorder.start(1000);
+  } catch (err) {
+    failRecording(`recording start failed: ${err?.message || err}`);
+    return false;
+  }
+  setRecordButton();
+  return true;
+}
+
+function getRecordingCameraFrame(frame) {
+  const referenceSpace = renderer.xr.getReferenceSpace();
+  const viewerPose = referenceSpace ? frame.getViewerPose(referenceSpace) : null;
+  if (!viewerPose) return null;
+  const viewIndex = viewerPose.views.findIndex((view) => view.camera);
+  if (viewIndex < 0) return null;
+  const view = viewerPose.views[viewIndex];
+  const xrCamera = renderer.xr.getCamera();
+  const viewCamera = xrCamera.cameras[viewIndex] || xrCamera.cameras[0];
+  if (!viewCamera) return null;
+  try {
+    const cameraTexture = renderer.xr.getCameraTexture(view.camera);
+    return cameraTexture ? { cameraTexture, view, viewCamera } : null;
+  } catch (err) {
+    console.warn("[recording] camera texture", err);
+    return null;
+  }
+}
+
+function prepareRecordingCanvas(width, height) {
+  const maxDimension = 1280;
+  const scale = Math.min(1, maxDimension / Math.max(width, height));
+  const outputWidth = Math.max(1, Math.round(width * scale));
+  const outputHeight = Math.max(1, Math.round(height * scale));
+  if (recordingCanvas.width !== outputWidth || recordingCanvas.height !== outputHeight) {
+    recordingCanvas.width = outputWidth;
+    recordingCanvas.height = outputHeight;
+    recordingContext.imageSmoothingEnabled = true;
+  }
+}
+
+function recordingDimensions(cameraFrame) {
+  const { viewCamera } = cameraFrame;
+  const canvas = renderer.domElement;
+  const viewport = viewCamera.viewport;
+  const width = Math.max(1, Math.min(canvas.width, Math.round(viewport?.z || canvas.width)));
+  const height = Math.max(1, Math.min(canvas.height, Math.round(viewport?.w || canvas.height)));
+  return { width, height };
+}
+
+function composeRecordingFrame(cameraFrame) {
+  const { cameraTexture, view, viewCamera } = cameraFrame;
+  const canvas = renderer.domElement;
+  const { width, height } = recordingDimensions(cameraFrame);
+  const sourceAspect = view.camera?.width && view.camera?.height
+    ? view.camera.width / view.camera.height
+    : width / height;
+  const targetAspect = width / height;
+  const uvScale = recordingBackgroundMaterial.uniforms.uvScale.value;
+  if (sourceAspect > targetAspect) {
+    uvScale.set(targetAspect / sourceAspect, 1);
+  } else {
+    uvScale.set(1, sourceAspect / targetAspect);
+  }
+  recordingBackgroundMaterial.uniforms.cameraTexture.value = cameraTexture;
+  prepareRecordingCanvas(width, height);
+
+  const previousXrEnabled = renderer.xr.enabled;
+  const previousAutoClear = renderer.autoClear;
+  const previousViewport = viewCamera.viewport;
+  try {
+    // XR's camera feed is composited by the browser and is not part of the
+    // normal canvas capture. Render an aligned copy to the default framebuffer
+    // while the raw texture is valid, then copy only the first view to the
+    // ordinary recording canvas.
+    renderer.xr.enabled = false;
+    renderer.setRenderTarget(null);
+    renderer.setScissorTest(false);
+    renderer.setViewport(0, 0, width, height);
+    renderer.autoClear = true;
+    renderer.render(recordingBackgroundScene, recordingBackgroundCamera);
+    renderer.autoClear = false;
+    renderer.clearDepth();
+    viewCamera.viewport = undefined;
+    renderer.render(scene, viewCamera);
+
+    const sourceY = Math.max(0, canvas.height - height);
+    recordingContext.drawImage(
+      canvas, 0, sourceY, width, height,
+      0, 0, recordingCanvas.width, recordingCanvas.height,
+    );
+  } finally {
+    viewCamera.viewport = previousViewport;
+    renderer.autoClear = previousAutoClear;
+    renderer.xr.enabled = previousXrEnabled;
+    // Raw camera textures are only valid for this XR animation frame. Reset
+    // Three's bindings after the copy so the opaque texture is not retained.
+    renderer.resetState();
+    recordingBackgroundMaterial.uniforms.cameraTexture.value = null;
+  }
+}
+
+function handleRecordingFrame(timestamp, cameraFrame) {
+  if (!cameraFrame) {
+    if (recording.pending) {
+      recording.pendingFrames += 1;
+      if (recording.pendingFrames >= 12) {
+        failRecording("camera texture unavailable - use Android system screen recording");
+      }
+    } else if (recording.recorder) {
+      failRecording("camera texture lost - recording stopped");
+    }
+    return;
+  }
+  if (recording.pending) {
+    const { width, height } = recordingDimensions(cameraFrame);
+    // Set the capture track's dimensions before constructing MediaRecorder.
+    prepareRecordingCanvas(width, height);
+    if (!beginRecording(timestamp)) return;
+  }
+  if (!recording.recorder || recording.recorder.state !== "recording") return;
+  if (timestamp - recording.startedAt >= MAX_RECORDING_MS) {
+    stopRecording("60-second recording limit reached");
+    return;
+  }
+  if (timestamp - recording.lastFrameAt < 1000 / RECORDING_FPS) return;
+  try {
+    composeRecordingFrame(cameraFrame);
+    recording.lastFrameAt = timestamp;
+    setRecordButton();
+  } catch (err) {
+    console.error("[recording] compose", err);
+    failRecording(`recording failed: ${err?.message || err}`);
+  }
+}
+
 function showGameUi(v) {
   $("touch-zone").hidden = !v;
   $("actions").hidden = !v;
@@ -283,6 +648,11 @@ function showGameUi(v) {
   areaTag.hidden = !v;
   for (const c of gameChips) c.hidden = !v;
 }
+bindButton(btnRecord, () => {
+  if (recording.pending || recording.recorder) stopRecording();
+  else requestRecording();
+});
+
 let kickFoot = "left";
 bindButton($("btn-kick"), () => {
   if (sim?.triggerKick(kickFoot)) kickFoot = kickFoot === "left" ? "right" : "left";
@@ -475,11 +845,13 @@ async function startAr() {
   const overlayRoot = overlay;
   xrSession = await navigator.xr.requestSession("immersive-ar", {
     requiredFeatures: ["hit-test"],
+    // camera-access: optional Raw Camera Access for the recorder. A denial
+    // still leaves ordinary AR available and REC will explain the fallback.
     // anchors: pin the play area against tracking drift (Variant Launch
     // and ARCore both offer them). depth-sensing: real-world occlusion,
     // granted on Android Chrome (three renders the occlusion automatically);
     // iOS wrappers don't expose depth yet.
-    optionalFeatures: ["dom-overlay", "local-floor", "anchors", "depth-sensing", "light-estimation"],
+    optionalFeatures: ["dom-overlay", "local-floor", "anchors", "depth-sensing", "light-estimation", "camera-access"],
     depthSensing: { usagePreference: ["gpu-optimized"], dataFormatPreference: ["luminance-alpha"] },
     domOverlay: { root: overlayRoot },
   });
@@ -517,6 +889,7 @@ async function startAr() {
     if (placing && reticle.visible && hitStable) placeAnchorFromReticle();
   });
   xrSession.addEventListener("end", () => {
+    stopRecording("AR session ended");
     xrSession = null;
     hitTestSource = null;
     xrAnchor = null;
@@ -592,6 +965,10 @@ function exitPreview() {
 renderer.setAnimationLoop((t, frame) => {
   pollKeyboard();
   joystick.poll();
+  let recordingCameraFrame = null;
+  if (frame && (recording.pending || recording.recorder)) {
+    recordingCameraFrame = getRecordingCameraFrame(frame);
+  }
   if (frame && hitTestSource && placing) {
     const hits = frame.getHitTestResults(hitTestSource);
     if (hits.length) {
@@ -640,6 +1017,9 @@ renderer.setAnimationLoop((t, frame) => {
   syncFromSim();
   if (previewOn && controls) controls.update();
   renderer.render(scene, camera);
+  if (frame && (recording.pending || recording.recorder)) {
+    handleRecordingFrame(t, recordingCameraFrame);
+  }
 });
 
 // ── Landing buttons ─────────────────────────────────────────────────────
